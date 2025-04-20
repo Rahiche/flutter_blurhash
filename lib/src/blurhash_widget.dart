@@ -107,7 +107,7 @@ class BlurHashState extends State<BlurHash> {
   }
 
   void _decodeImage() {
-    _image = blurHashDecodeImage(
+    _image = enhancedBlurHashDecodeImage(
       blurHash: widget.hash,
       width: widget.decodingWidth,
       height: widget.decodingHeight,

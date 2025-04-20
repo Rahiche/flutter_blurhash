@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math';
 import 'dart:ui' as ui;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
@@ -13,17 +14,181 @@ enum BlurHashOptimizationMode {
   standard,
 
   /// Approximation with faster sRGB conversion + cache locality
-  approximation
+  approximation,
+
+  /// Fast implementation with approximate cosine and lookup table
+  fast
 }
 
-// Optimized BlurHash decode implementation
-Future<Uint8List> optimizedBlurHashDecode({
+// Pre-compute lookup table for digit characters
+final Uint8List _digitLookup = _createDigitLookup();
+
+Uint8List _createDigitLookup() {
+  final lookup = Uint8List(128);
+  for (var i = 0; i < 83; i++) {
+    lookup[_digitCharacters.codeUnitAt(i)] = i;
+  }
+  return lookup;
+}
+
+// Constants for optimized sRGB conversion
+const double _d = 3294.6;
+const double _e = 269.025;
+
+// Fast decode83 using lookup table
+int _fastDecode83(String str, int start, int end) {
+  var value = 0;
+  while (start < end) {
+    value *= 83;
+    value += _digitLookup[str.codeUnitAt(start++)];
+  }
+  return value;
+}
+
+// Original decode83 for fallback
+int _decode83(String str) {
+  var value = 0;
+  final units = str.codeUnits;
+  final digits = _digitCharacters.codeUnits;
+  for (var i = 0; i < units.length; i++) {
+    final code = units.elementAt(i);
+    final digit = digits.indexOf(code);
+    if (digit == -1) {
+      throw ArgumentError.value(str, 'str');
+    }
+    value = value * 83 + digit;
+  }
+  return value;
+}
+
+// Optimized sRGB to linear conversion
+double _fastSRGBToLinear(int value) {
+  final v = value.toDouble();
+  return v > 10.31475 ? pow(v / _e + 0.052132, 2.4) as double : v / _d;
+}
+
+// Optimized linear to sRGB conversion
+int _fastLinearTosRGB(double v) {
+  return (v > 0.00001227 ? _e * pow(v, 0.416666) - 13.025 : v * _d + 1).toInt();
+}
+
+// Fast sign square function
+double _signSqr(double x) => (x < 0 ? -1 : 1) * x * x;
+
+// Fast approximate cosine implementation
+double _fastCos(double x) {
+  const pi2 = pi * 2;
+  x += pi / 2;
+  while (x > pi) {
+    x -= pi2;
+  }
+  final cos = 1.27323954 * x - 0.405284735 * _signSqr(x);
+  return 0.225 * (_signSqr(cos) - cos) + cos;
+}
+
+// Optimize BlurHash decode with fast implementations
+Future<Uint8List> fastBlurHashDecode({
+  required String blurHash,
+  required int width,
+  required int height,
+  double punch = 1.0,
+}) {
+  if (blurHash.length < 6) {
+    throw Exception('The blurhash string must be at least 6 characters');
+  }
+
+  final sizeFlag = _fastDecode83(blurHash, 0, 1);
+  final numY = (sizeFlag ~/ 9) + 1;
+  final numX = (sizeFlag % 9) + 1;
+  final size = numX * numY;
+
+  if (blurHash.length != 4 + 2 * numX * numY) {
+    throw Exception(
+        'blurhash length mismatch: length is ${blurHash.length} but '
+        'it should be ${4 + 2 * numX * numY}');
+  }
+
+  final maximumValue = (_fastDecode83(blurHash, 1, 2) + 1) / 13446 * punch;
+
+  // Use a 1D array for better cache locality
+  final colors = Float64List(size * 3);
+
+  // Decode DC component
+  final averageColor = _fastDecode83(blurHash, 2, 6);
+  colors[0] = _fastSRGBToLinear(averageColor >> 16);
+  colors[1] = _fastSRGBToLinear((averageColor >> 8) & 255);
+  colors[2] = _fastSRGBToLinear(averageColor & 255);
+
+  // Decode AC components
+  for (var i = 1; i < size; i++) {
+    final value = _fastDecode83(blurHash, 4 + i * 2, 6 + i * 2);
+    colors[i * 3] = _signSqr((value ~/ 361) - 9) * maximumValue;
+    colors[i * 3 + 1] = _signSqr(((value ~/ 19) % 19) - 9) * maximumValue;
+    colors[i * 3 + 2] = _signSqr((value % 19) - 9) * maximumValue;
+  }
+
+  // Precalculate cosines and store in 1D arrays for better cache performance
+  final cosinesY = Float64List(numY * height);
+  final cosinesX = Float64List(numX * width);
+
+  for (var j = 0; j < numY; j++) {
+    for (var y = 0; y < height; y++) {
+      cosinesY[j * height + y] = _fastCos((pi * y * j) / height);
+    }
+  }
+
+  for (var i = 0; i < numX; i++) {
+    for (var x = 0; x < width; x++) {
+      cosinesX[i * width + x] = _fastCos((pi * x * i) / width);
+    }
+  }
+
+  final bytesPerRow = width * 4;
+  final pixels = Uint8List(bytesPerRow * height);
+
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      var r = 0.0, g = 0.0, b = 0.0;
+
+      for (var j = 0; j < numY; j++) {
+        final basisY = cosinesY[j * height + y];
+        for (var i = 0; i < numX; i++) {
+          final basis = cosinesX[i * width + x] * basisY;
+          final colorIndex = (i + j * numX) * 3;
+          r += colors[colorIndex] * basis;
+          g += colors[colorIndex + 1] * basis;
+          b += colors[colorIndex + 2] * basis;
+        }
+      }
+
+      final pixelIndex = 4 * x + y * bytesPerRow;
+      pixels[pixelIndex] = _fastLinearTosRGB(r);
+      pixels[pixelIndex + 1] = _fastLinearTosRGB(g);
+      pixels[pixelIndex + 2] = _fastLinearTosRGB(b);
+      pixels[pixelIndex + 3] = 255; // Alpha is always 255
+    }
+  }
+
+  return Future.value(pixels);
+}
+
+// Enhanced decode function that includes all optimizations
+Future<Uint8List> enhancedBlurHashDecode({
   required String blurHash,
   required int width,
   required int height,
   double punch = 1.0,
   BlurHashOptimizationMode optimizationMode = BlurHashOptimizationMode.standard,
 }) {
+  if (optimizationMode == BlurHashOptimizationMode.fast) {
+    return fastBlurHashDecode(
+      blurHash: blurHash,
+      width: width,
+      height: height,
+      punch: punch,
+    );
+  }
+
   _validateBlurHash(blurHash);
 
   final sizeFlag = _decode83(blurHash[0]);
@@ -106,6 +271,7 @@ Future<Uint8List> optimizedBlurHashDecode({
               break;
             case BlurHashOptimizationMode.standard:
             case BlurHashOptimizationMode.none:
+            case BlurHashOptimizationMode.fast:
               pixels[p++] = _linearTosRGB(r);
               pixels[p++] = _linearTosRGB(g);
               pixels[p++] = _linearTosRGB(b);
@@ -121,8 +287,54 @@ Future<Uint8List> optimizedBlurHashDecode({
   return Future.value(pixels);
 }
 
+// Enhanced image decode with all optimization modes
+Future<ui.Image> enhancedBlurHashDecodeImage({
+  required String blurHash,
+  required int width,
+  required int height,
+  double punch = 1.0,
+  BlurHashOptimizationMode optimizationMode = BlurHashOptimizationMode.standard,
+}) async {
+  final completer = Completer<ui.Image>();
+
+  final Uint8List pixels = await enhancedBlurHashDecode(
+    blurHash: blurHash,
+    width: width,
+    height: height,
+    punch: punch,
+    optimizationMode: optimizationMode,
+  );
+
+  if (kIsWeb) {
+    completer.complete(_createBmp(pixels, width, height));
+  } else {
+    ui.decodeImageFromPixels(
+        pixels, width, height, ui.PixelFormat.rgba8888, completer.complete);
+  }
+
+  return completer.future;
+}
+
+// Keep original functions for backward compatibility
+double _sRGBToLinear(int value) {
+  final v = value / 255;
+  if (v <= 0.04045) {
+    return v / 12.92;
+  } else {
+    return pow((v + 0.055) / 1.055, 2.4) as double;
+  }
+}
+
+int _linearTosRGB(double value) {
+  final v = max(0, min(1, value));
+  if (v <= 0.0031308) {
+    return (v * 12.92 * 255 + 0.5).round();
+  } else {
+    return ((1.055 * pow(v, 1 / 2.4) - 0.055) * 255 + 0.5).round();
+  }
+}
+
 /// Approximated version using square roots for faster computation
-/// This will produce slightly different (darker) results but is faster
 int _approximatedLinearTosRGB(double value) {
   final v = max(0.0, min(1.0, value));
 
@@ -136,104 +348,45 @@ int _approximatedLinearTosRGB(double value) {
   }
 }
 
-Future<Uint8List> blurHashDecode({
-  required String blurHash,
-  required int width,
-  required int height,
-  double punch = 1.0,
-}) {
-  _validateBlurHash(blurHash);
+void _validateBlurHash(String blurHash) {
+  if (blurHash.length < 6) {
+    throw Exception('The blurhash string must be at least 6 characters');
+  }
 
   final sizeFlag = _decode83(blurHash[0]);
   final numY = (sizeFlag / 9).floor() + 1;
   final numX = (sizeFlag % 9) + 1;
 
-  final quantisedMaximumValue = _decode83(blurHash[1]);
-  final maximumValue = (quantisedMaximumValue + 1) / 166;
-
-  final colors = []..length = numX * numY;
-
-  for (var i = 0; i < colors.length; i++) {
-    if (i == 0) {
-      final value = _decode83(blurHash.substring(2, 6));
-      colors[i] = _decodeDC(value);
-    } else {
-      final value = _decode83(blurHash.substring(4 + i * 2, 6 + i * 2));
-      colors[i] = _decodeAC(value, maximumValue * punch);
-    }
+  if (blurHash.length != 4 + 2 * numX * numY) {
+    throw Exception(
+        'blurhash length mismatch: length is ${blurHash.length} but '
+        'it should be ${4 + 2 * numX * numY}');
   }
-
-  final bytesPerRow = width * 4;
-  final pixels = Uint8List(bytesPerRow * height);
-
-  int p = 0;
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < width; x++) {
-      var r = .0;
-      var g = .0;
-      var b = .0;
-
-      for (int j = 0; j < numY; j++) {
-        for (int i = 0; i < numX; i++) {
-          final basis = cos((pi * x * i) / width) * cos((pi * y * j) / height);
-          var color = colors[i + j * numX];
-          r += color[0] * basis;
-          g += color[1] * basis;
-          b += color[2] * basis;
-        }
-      }
-
-      final intR = _linearTosRGB(r);
-      final intG = _linearTosRGB(g);
-      final intB = _linearTosRGB(b);
-
-      pixels[p++] = intR;
-      pixels[p++] = intG;
-      pixels[p++] = intB;
-      pixels[p++] = 255;
-    }
-  }
-
-  return Future.value(pixels);
 }
 
-Future<ui.Image> blurHashDecodeImage({
-  required String blurHash,
-  required int width,
-  required int height,
-  double punch = 1.0,
-  BlurHashOptimizationMode optimizationMode = BlurHashOptimizationMode.standard,
-}) async {
-  _validateBlurHash(blurHash);
+int _sign(double n) => (n < 0 ? -1 : 1);
 
-  final completer = Completer<ui.Image>();
+num _signPow(double val, double exp) => _sign(val) * pow(val.abs(), exp);
 
-  final Uint8List pixels;
-  if (optimizationMode != BlurHashOptimizationMode.none) {
-    pixels = await optimizedBlurHashDecode(
-      blurHash: blurHash,
-      width: width,
-      height: height,
-      punch: punch,
-      optimizationMode: optimizationMode,
-    );
-  } else {
-    pixels = await blurHashDecode(
-      blurHash: blurHash,
-      width: width,
-      height: height,
-      punch: punch,
-    );
-  }
+List<double> _decodeDC(int value) {
+  final intR = value >> 16;
+  final intG = (value >> 8) & 255;
+  final intB = value & 255;
+  return [_sRGBToLinear(intR), _sRGBToLinear(intG), _sRGBToLinear(intB)];
+}
 
-  if (kIsWeb) {
-    completer.complete(_createBmp(pixels, width, height));
-  } else {
-    ui.decodeImageFromPixels(
-        pixels, width, height, ui.PixelFormat.rgba8888, completer.complete);
-  }
+List<double> _decodeAC(int value, double maximumValue) {
+  final quantR = (value / (19 * 19)).floor();
+  final quantG = (value / 19).floor() % 19;
+  final quantB = value % 19;
 
-  return completer.future;
+  final rgb = [
+    _signPow((quantR - 9) / 9, 2.0) * maximumValue,
+    _signPow((quantG - 9) / 9, 2.0) * maximumValue,
+    _signPow((quantB - 9) / 9, 2.0) * maximumValue
+  ];
+
+  return rgb;
 }
 
 Future<ui.Image> _createBmp(Uint8List pixels, int width, int height) async {
@@ -259,80 +412,6 @@ Future<ui.Image> _createBmp(Uint8List pixels, int width, int height) async {
   final codec = await ui.instantiateImageCodec(bmp);
   final frame = await codec.getNextFrame();
   return frame.image;
-}
-
-double _sRGBToLinear(int value) {
-  final v = value / 255;
-  if (v <= 0.04045) {
-    return v / 12.92;
-  } else {
-    return pow((v + 0.055) / 1.055, 2.4) as double;
-  }
-}
-
-int _linearTosRGB(double value) {
-  final v = max(0, min(1, value));
-  if (v <= 0.0031308) {
-    return (v * 12.92 * 255 + 0.5).round();
-  } else {
-    return ((1.055 * pow(v, 1 / 2.4) - 0.055) * 255 + 0.5).round();
-  }
-}
-
-void _validateBlurHash(String blurHash) {
-  if (blurHash.length < 6) {
-    throw Exception('The blurhash string must be at least 6 characters');
-  }
-
-  final sizeFlag = _decode83(blurHash[0]);
-  final numY = (sizeFlag / 9).floor() + 1;
-  final numX = (sizeFlag % 9) + 1;
-
-  if (blurHash.length != 4 + 2 * numX * numY) {
-    throw Exception(
-        'blurhash length mismatch: length is ${blurHash.length} but '
-        'it should be ${4 + 2 * numX * numY}');
-  }
-}
-
-int _sign(double n) => (n < 0 ? -1 : 1);
-
-num _signPow(double val, double exp) => _sign(val) * pow(val.abs(), exp);
-
-int _decode83(String str) {
-  var value = 0;
-  final units = str.codeUnits;
-  final digits = _digitCharacters.codeUnits;
-  for (var i = 0; i < units.length; i++) {
-    final code = units.elementAt(i);
-    final digit = digits.indexOf(code);
-    if (digit == -1) {
-      throw ArgumentError.value(str, 'str');
-    }
-    value = value * 83 + digit;
-  }
-  return value;
-}
-
-List<double> _decodeDC(int value) {
-  final intR = value >> 16;
-  final intG = (value >> 8) & 255;
-  final intB = value & 255;
-  return [_sRGBToLinear(intR), _sRGBToLinear(intG), _sRGBToLinear(intB)];
-}
-
-List<double> _decodeAC(int value, double maximumValue) {
-  final quantR = (value / (19 * 19)).floor();
-  final quantG = (value / 19).floor() % 19;
-  final quantB = value % 19;
-
-  final rgb = [
-    _signPow((quantR - 9) / 9, 2.0) * maximumValue,
-    _signPow((quantG - 9) / 9, 2.0) * maximumValue,
-    _signPow((quantB - 9) / 9, 2.0) * maximumValue
-  ];
-
-  return rgb;
 }
 
 bool validateBlurhash(String blurhash) {
